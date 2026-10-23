@@ -2,74 +2,126 @@ import os
 import re
 import requests
 from requests.auth import HTTPBasicAuth
+from dotenv import load_dotenv
 
-# --- CONFIGURATION ---
-STORE_URL = "https://containersvent.com/wp-json/wc/v3"
-WC_CONSUMER_KEY = "ck_b8cd59a153048f0392f82f397669a28cf3f527e5"
-WC_CONSUMER_SECRET = "cs_e68f6c7e51157d9147077716d4c2270f3bf3d66e"
+# --- LOAD ENVIRONMENT VARIABLES ---
+load_dotenv()
 
-wc_auth = HTTPBasicAuth(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
+STORE_URL = os.getenv("STORE_URL")
+WC_CONSUMER_KEY = os.getenv("WC_CONSUMER_KEY")
+WC_CONSUMER_SECRET = os.getenv("WC_CONSUMER_SECRET")
 
-def generate_sku_from_name(name):
+# Request timeout in seconds
+TIMEOUT = 30
+
+def generate_unique_sku(base_name, existing_skus):
     """
-    Converts a product name into a clean SKU format.
-    Example: '20ft Standard Shipping Container' -> 'CONT-20FT-STANDARD-SHIPPING'
+    Converts a product name into a clean SKU format and ensures uniqueness.
     """
-    # Remove special characters, convert to uppercase
-    clean_name = re.sub(r'[^a-zA-Z0-9\s]', '', name).upper()
+    clean_name = re.sub(r'[^a-zA-Z0-9\s]', '', base_name).upper()
     words = clean_name.split()
     
-    # Prefix with 'CONT-' and join up to the first 4 words to keep it clean
     sku_base = "-".join(words[:4])
-    return f"CONT-{sku_base}"
-
-print("Starting SKU auto-generation and update process...\n")
-
-page = 1
-total_updated = 0
-
-while True:
-    # Fetch products page by page (50 per batch)
-    response = requests.get(
-        f"{STORE_URL}/products", 
-        params={"per_page": 50, "page": page}, 
-        auth=wc_auth
-    )
+    candidate_sku = f"CONT-{sku_base}"
     
-    if response.status_code != 200:
-        print(f"[Error] Failed to fetch products: {response.text}")
-        break
+    # Handle duplicate SKU collisions
+    unique_sku = candidate_sku
+    counter = 1
+    while unique_sku in existing_skus:
+        counter += 1
+        unique_sku = f"{candidate_sku}-{counter}"
         
-    products = response.json()
-    if not products:
-        break # No more products left to check
-        
-    for product in products:
-        product_id = product["id"]
-        name = product["name"]
-        current_sku = product.get("sku", "").strip()
-        
-        # Only update if the SKU field is currently empty
-        if not current_sku:
-            new_sku = generate_sku_from_name(name)
-            print(f"Product: '{name}' (ID: {product_id})")
-            print(f"   -> Assigning new SKU: {new_sku}")
-            
-            update_data = {"sku": new_sku}
-            update_response = requests.put(
-                f"{STORE_URL}/products/{product_id}", 
-                json=update_data, 
-                auth=wc_auth
-            )
-            
-            if update_response.status_code == 200:
-                print("   -> Successfully updated!\n")
-                total_updated += 1
-            else:
-                print(f"   -> [Error] Failed to update: {update_response.text}\n")
-        else:
-            print(f"Skipping '{name}' (Already has SKU: {current_sku})")
-            
-    page += 1
+    existing_skus.add(unique_sku)
+    return unique_sku
 
-print(f"Finished! Total products updated with new SKUs: {total_updated}")
+def main():
+    if not STORE_URL or not WC_CONSUMER_KEY or not WC_CONSUMER_SECRET:
+        print("[Error] Missing store URL or WooCommerce credentials in environment variables.")
+        return
+
+    # Create a persistent session for connection pooling
+    session = requests.Session()
+    session.auth = HTTPBasicAuth(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
+
+    print("Starting SKU auto-generation and update process...\n")
+
+    page = 1
+    total_updated = 0
+    existing_skus = set()
+
+    # Step 1: Pre-load existing SKUs to avoid local collisions
+    print("Fetching existing store SKUs to prevent duplicates...")
+    while True:
+        try:
+            response = session.get(
+                f"{STORE_URL}/products", 
+                params={"per_page": 100, "page": page, "_fields": "sku"}, 
+                timeout=TIMEOUT
+            )
+            response.raise_for_status()
+            products = response.json()
+            if not products:
+                break
+            for p in products:
+                if p.get("sku"):
+                    existing_skus.add(p["sku"].strip())
+            page += 1
+        except requests.exceptions.RequestException as e:
+            print(f"[Error] Failed fetching existing products: {e}")
+            break
+
+    print(f"Loaded {len(existing_skus)} existing SKUs. Beginning scan for empty SKUs...\n")
+
+    # Step 2: Iterate through products to find and assign missing SKUs
+    page = 1
+    while True:
+        try:
+            response = session.get(
+                f"{STORE_URL}/products", 
+                params={"per_page": 50, "page": page}, 
+                timeout=TIMEOUT
+            )
+            response.raise_for_status()
+            products = response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"[Error] Network error on page {page}: {e}")
+            break
+            
+        if not products:
+            break  # No more products left to check
+            
+        for product in products:
+            product_id = product["id"]
+            name = product["name"]
+            current_sku = product.get("sku", "").strip()
+            
+            # Only update if the SKU field is currently empty
+            if not current_sku:
+                new_sku = generate_unique_sku(name, existing_skus)
+                print(f"Product: '{name}' (ID: {product_id})")
+                print(f"    -> Assigning new SKU: {new_sku}")
+                
+                update_data = {"sku": new_sku}
+                try:
+                    update_response = session.put(
+                        f"{STORE_URL}/products/{product_id}", 
+                        json=update_data, 
+                        timeout=TIMEOUT
+                    )
+                    
+                    if update_response.status_code == 200:
+                        print("    -> Successfully updated!\n")
+                        total_updated += 1
+                    else:
+                        print(f"    -> [Error] Failed to update (Status {update_response.status_code}): {update_response.text}\n")
+                except requests.exceptions.RequestException as e:
+                    print(f"    -> [Error] Network error updating product {product_id}: {e}\n")
+            else:
+                print(f"Skipping '{name}' (Already has SKU: {current_sku})")
+                
+        page += 1
+
+    print(f"Finished! Total products updated with new SKUs: {total_updated}")
+
+if __name__ == "__main__":
+    main()
